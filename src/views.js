@@ -13,6 +13,9 @@ export function fmtDate(iso, tz) {
   if (!iso) return '—';
   return new Intl.DateTimeFormat('ru-RU', { timeZone: tz, dateStyle: 'short', timeStyle: 'short' }).format(new Date(iso));
 }
+export const stars = (n) => '★'.repeat(n) + '☆'.repeat(5 - n);
+export const money = (n) => `${new Intl.NumberFormat('ru-RU').format(n)} $`;
+
 export function fmtSize(n) {
   if (n < 1024) return `${n} Б`;
   if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} КБ`;
@@ -60,7 +63,7 @@ code{background:#101010;padding:2px 6px;border-radius:4px;word-break:break-all}.
 
 export function layout({ title, user, body, nav = '' }) {
   const links = [['/', 'Обзор'], ['/users', 'Пользователи'], ['/plan', 'План публикаций'], ['/files', 'Хранилище']];
-  if (user?.role === 'admin') links.push(['/admin', 'Управление']);
+  if (user?.role === 'admin') links.push(['/payouts', 'Выплаты'], ['/admin', 'Управление']);
   return html`<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title} — Delgado PH Stats</title><style>${raw(CSS)}</style></head><body>
 ${user ? html`<header><b>Delgado PH Stats</b><nav>${links.map(([h, t]) => html`<a href="${h}"${h === nav ? raw(' style="font-weight:700"') : raw('')}>${t}</a>`)}</nav>

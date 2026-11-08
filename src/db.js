@@ -3,6 +3,12 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 
 export const ROLES = ['admin', 'editor', 'viewer'];
+export const PLAN_KINDS = {
+  situation: 'Скриншот-ситуация',
+  event: 'Мероприятие',
+  radio: 'Радиоэфир',
+  other: 'Другое',
+};
 export const PLAN_STATUSES = {
   idea: 'Идея',
   draft: 'В работе',
@@ -48,6 +54,12 @@ CREATE TABLE IF NOT EXISTS plans (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ad_edits (   -- правки объявлений за неделю (вводятся вручную)
+  week_start TEXT NOT NULL,             -- понедельник, YYYY-MM-DD
+  employee TEXT NOT NULL COLLATE NOCASE,
+  count INTEGER NOT NULL CHECK (count >= 0),
+  PRIMARY KEY (week_start, employee)
+);
 CREATE TABLE IF NOT EXISTS folders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   parent_id INTEGER REFERENCES folders(id) ON DELETE CASCADE,
@@ -73,6 +85,11 @@ export function openDb(config) {
   const db = new DatabaseSync(config.dbFile);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
   db.exec(SCHEMA);
+  // Миграция плана публикаций: тип, оценка качества, ручная сумма (для мероприятий).
+  const cols = new Set(db.prepare('PRAGMA table_info(plans)').all().map((c) => c.name));
+  if (!cols.has('kind')) db.exec("ALTER TABLE plans ADD COLUMN kind TEXT NOT NULL DEFAULT 'other'");
+  if (!cols.has('rating')) db.exec('ALTER TABLE plans ADD COLUMN rating INTEGER CHECK (rating BETWEEN 1 AND 5)');
+  if (!cols.has('payout_override')) db.exec('ALTER TABLE plans ADD COLUMN payout_override INTEGER');
 
   db.tx = (fn) => {
     db.exec('BEGIN');

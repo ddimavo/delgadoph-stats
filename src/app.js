@@ -6,11 +6,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
-import { openDb, ROLES, PLAN_STATUSES } from './db.js';
+import { openDb, ROLES, PLAN_STATUSES, PLAN_KINDS } from './db.js';
+import { loadRates, parseRatesForm, calcWeek, weekStart, weekEnd, shiftWeek, DEFAULT_RATES } from './payouts.js';
+import { buildWorkbook } from './export.js';
 import { makeSession, readSession, makeLimiter } from './auth.js';
 import { sectionStats, overview, userLeaderboard } from './stats.js';
 import { parsePostLines, addPosts } from './manual.js';
-import { html, raw, layout, fmtDate, fmtSize, barChart, sparkline } from './views.js';
+import { html, raw, layout, fmtDate, fmtSize, barChart, sparkline, stars, money } from './views.js';
 
 const INLINE_IMAGES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const cleanName = (n) => String(n || 'file').replace(/[\\/]/g, '_').replace(/[\x00-\x1f"]/g, '').trim().slice(0, 200) || 'file';
@@ -75,7 +77,7 @@ export async function buildApp(config) {
     return page(reply, req, '/', 'Обзор', html`<h1>Обзор активности</h1>${flash(req)}
       <div class="cards">${[['Разделов', ov.sections], ['Постов всего', ov.total], ['За 24 часа', ov.day], ['За 7 дней', ov.week], ['За 30 дней', ov.month]]
         .map(([l, n]) => html`<div class="card"><div class="n">${n}</div><div class="l">${l}</div></div>`)}</div>
-      <h2>Разделы</h2>
+      <h2>Разделы <a href="/export.xlsx" style="font-size:13px;text-transform:none;letter-spacing:0;margin-left:12px">⬇ выгрузить всё в xlsx</a></h2>
       ${ranked.length ? html`<table><tr><th>Раздел</th><th class="r">Всего</th><th class="r">24ч</th><th class="r">7д</th><th class="r">30д</th><th class="r">Авторов 30д</th><th>30 дней</th><th>Последний пост</th><th>Активность</th></tr>
       ${ranked.map((s) => html`<tr><td><a href="/sections/${s.section.id}">${s.section.title}</a></td><td class="r">${s.total}</td><td class="r">${s.day}</td><td class="r">${s.week}</td><td class="r">${s.month}</td><td class="r">${s.authors30}</td>
         <td>${sparkline(s.perDay)}</td><td class="mute">${fmtDate(s.last, tz)}</td><td><span class="score">${s.score}</span></td></tr>`)}</table>
@@ -180,6 +182,9 @@ export async function buildApp(config) {
   const statusSelect = (name, cur) => html`<select name="${name}">${Object.entries(PLAN_STATUSES).map(([k, t]) => html`<option value="${k}"${k === cur ? raw(' selected') : raw('')}>${t}</option>`)}</select>`;
   const sectionSelect = (cur) => html`<select name="section_id"><option value="">— раздел не выбран —</option>${db.prepare('SELECT id, title FROM sections ORDER BY title').all().map((s) => html`<option value="${s.id}"${s.id === cur ? raw(' selected') : raw('')}>${s.title}</option>`)}</select>`;
 
+  const kindSelect = (cur) => html`<select name="kind">${Object.entries(PLAN_KINDS).map(([k, t]) => html`<option value="${k}"${k === cur ? raw(' selected') : raw('')}>${t}</option>`)}</select>`;
+  const ratingSelect = (cur) => html`<select name="rating"><option value="">— не оценено —</option>${[5, 4, 3, 2, 1].map((n) => html`<option value="${n}"${n === cur ? raw(' selected') : raw('')}>${stars(n)}</option>`)}</select>`;
+
   function readPlanForm(b) {
     const title = String(b.title || '').trim().slice(0, 300);
     if (!title) return { error: 'Укажите название публикации' };
@@ -188,7 +193,16 @@ export async function buildApp(config) {
     if (date && !isDate(date)) return { error: 'Некорректная дата' };
     const sid = b.section_id ? Number(b.section_id) : null;
     if (sid && !db.prepare('SELECT 1 FROM sections WHERE id = ?').get(sid)) return { error: 'Раздел не найден' };
-    return { v: { title, status, date, sid, description: String(b.description || '').slice(0, 5000), assignee: String(b.assignee || '').trim().slice(0, 64) } };
+    const kind = Object.hasOwn(PLAN_KINDS, b.kind) ? b.kind : 'other';
+    const rating = b.rating ? Number(b.rating) : null;
+    if (rating !== null && !(Number.isInteger(rating) && rating >= 1 && rating <= 5)) return { error: 'Оценка — от 1 до 5 звёзд' };
+    const ovRaw = String(b.payout_override || '').replace(/[\s_.]/g, '');
+    const override = ovRaw ? Number(ovRaw) : null;
+    if (override !== null) {
+      const { min, max } = loadRates(db).event;
+      if (!/^\d+$/.test(ovRaw) || override < min || override > max) return { error: `Ручная сумма за мероприятие — от ${money(min)} до ${money(max)}` };
+    }
+    return { v: { title, status, date, sid, kind, rating, override, description: String(b.description || '').trim().slice(0, 500), assignee: String(b.assignee || '').trim().slice(0, 64) } };
   }
 
   app.get('/plan', async (req, reply) => {
@@ -202,16 +216,20 @@ export async function buildApp(config) {
       ${edit ? html`<form method="post" action="/plan"><div class="row">
         <label style="flex:2;min-width:220px">Название<input name="title" required maxlength="300"></label>
         <label>Дата<input type="date" name="planned_date"></label><label>Статус${statusSelect('status', 'idea')}</label>
-        <label>Раздел${sectionSelect(null)}</label><label>Ответственный<input name="assignee" placeholder="Ник" maxlength="64"></label></div>
-        <div class="row"><label style="flex:1;min-width:300px">Заметки<textarea name="description" rows="2"></textarea></label><button>Добавить</button></div></form>` : ''}
-      <table><tr><th>Дата</th><th>Публикация</th><th>Раздел</th><th>Ответственный</th><th>Статус</th><th>Файлы</th></tr>
+        <label>Раздел${sectionSelect(null)}</label><label>Ответственный<input name="assignee" placeholder="Ник" maxlength="64"></label>
+        <label>Тип${kindSelect('other')}</label><label>Оценка${ratingSelect(null)}</label></div>
+        <div class="row"><label style="flex:1;min-width:300px">Краткое описание (до 500 символов)<textarea name="description" rows="2" maxlength="500"></textarea></label><button>Добавить</button></div></form>` : ''}
+      <table><tr><th>Дата</th><th>Публикация</th><th>Тип</th><th>Оценка</th><th>Раздел</th><th>Ответственный</th><th>Статус</th><th>Файлы</th></tr>
       ${plans.map((p) => html`<tr><td>${p.planned_date || '—'}</td><td><b>${p.title}</b>${p.description ? html`<div class="mute">${p.description}</div>` : ''}
         ${edit ? html`<details><summary class="mute">изменить</summary>
           <form method="post" action="/plan/${p.id}"><div class="row"><label>Название<input name="title" value="${p.title}" required></label><label>Дата<input type="date" name="planned_date" value="${p.planned_date || ''}"></label>
-          <label>Статус${statusSelect('status', p.status)}</label><label>Раздел${sectionSelect(p.section_id)}</label><label>Ответственный<input name="assignee" value="${p.assignee}"></label></div>
-          <div class="row"><label style="flex:1">Заметки<textarea name="description" rows="2">${p.description}</textarea></label><button>Сохранить</button></div></form>
+          <label>Статус${statusSelect('status', p.status)}</label><label>Раздел${sectionSelect(p.section_id)}</label><label>Ответственный<input name="assignee" value="${p.assignee}"></label>
+          <label>Тип${kindSelect(p.kind)}</label><label>Оценка${ratingSelect(p.rating)}</label>
+          <label>Сумма вручную, $ (мероприятия)<input name="payout_override" value="${p.payout_override ?? ''}" inputmode="numeric" placeholder="по оценке"></label></div>
+          <div class="row"><label style="flex:1">Краткое описание (до 500 символов)<textarea name="description" rows="2" maxlength="500">${p.description}</textarea></label><button>Сохранить</button></div></form>
           <form method="post" action="/plan/${p.id}/delete" onsubmit="return confirm('Удалить публикацию?')"><button class="danger">Удалить</button></form>
           <form method="post" action="/files/upload" enctype="multipart/form-data"><input type="hidden" name="plan_id" value="${p.id}"><div class="row"><input type="file" name="file" multiple required><button>Прикрепить файлы</button></div></form></details>` : ''}</td>
+        <td>${PLAN_KINDS[p.kind]}</td><td style="white-space:nowrap;color:var(--acc)">${p.rating ? stars(p.rating) : html`<span class="mute">—</span>`}</td>
         <td>${p.section_id ? html`<a href="/sections/${p.section_id}">${p.section_title}</a>` : '—'}</td><td>${p.assignee || '—'}</td>
         <td><span class="tag ${p.status}">${PLAN_STATUSES[p.status]}</span></td>
         <td>${files.filter((f) => f.plan_id === p.id).map((f) => html`<div><a href="/files/${f.id}/download">${f.original_name}</a></div>`)}</td></tr>`)}</table>
@@ -223,8 +241,8 @@ export async function buildApp(config) {
     const r = readPlanForm(req.body || {});
     if (r.error) return redirect(reply, '/plan', r.error);
     const t = new Date().toISOString(), v = r.v;
-    db.prepare('INSERT INTO plans (title, description, section_id, planned_date, status, assignee, created_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)')
-      .run(v.title, v.description, v.sid, v.date, v.status, v.assignee, req.user.nick, t, t);
+    db.prepare('INSERT INTO plans (title, description, section_id, planned_date, status, assignee, kind, rating, payout_override, created_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(v.title, v.description, v.sid, v.date, v.status, v.assignee, v.kind, v.rating, v.override, req.user.nick, t, t);
     return redirect(reply, '/plan', 'Публикация добавлена');
   });
   app.post('/plan/:id', async (req, reply) => {
@@ -232,8 +250,8 @@ export async function buildApp(config) {
     const r = readPlanForm(req.body || {});
     if (r.error) return redirect(reply, '/plan', r.error);
     const v = r.v;
-    db.prepare('UPDATE plans SET title=?, description=?, section_id=?, planned_date=?, status=?, assignee=?, updated_at=? WHERE id=?')
-      .run(v.title, v.description, v.sid, v.date, v.status, v.assignee, new Date().toISOString(), Number(req.params.id));
+    db.prepare('UPDATE plans SET title=?, description=?, section_id=?, planned_date=?, status=?, assignee=?, kind=?, rating=?, payout_override=?, updated_at=? WHERE id=?')
+      .run(v.title, v.description, v.sid, v.date, v.status, v.assignee, v.kind, v.rating, v.override, new Date().toISOString(), Number(req.params.id));
     return redirect(reply, '/plan', 'Сохранено');
   });
   app.post('/plan/:id/delete', async (req, reply) => {
@@ -348,6 +366,77 @@ export async function buildApp(config) {
     }
     const back = planId ? '/plan' : `/files?folder=${folderId || rootId()}`;
     return redirect(reply, back, error || (saved.length ? `Загружено файлов: ${saved.length}` : 'Файлы не выбраны'));
+  });
+
+  // --- выгрузка в xlsx ---------------------------------------------------
+  const weekParam = (q) => weekStart(isDate(String(q || '')) ? q : new Date().toISOString().slice(0, 10));
+  app.get('/export.xlsx', async (req, reply) => {
+    const wk = weekParam(req.query.week);
+    const buf = await buildWorkbook(db, config, { rates: loadRates(db), weekStart: wk, includePayouts: req.user.role === 'admin' });
+    return reply.header('Content-Disposition', `attachment; filename="delgadoph-stats-${new Date().toISOString().slice(0, 10)}.xlsx"`)
+      .type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet').send(Buffer.from(buf));
+  });
+
+  // --- выплаты (только администратор) ------------------------------------
+  const adminOnlyPage = async (req, reply) => { if (req.user.role !== 'admin') return forbid(reply); };
+  app.get('/payouts', { preHandler: adminOnlyPage }, async (req, reply) => {
+    const wk = weekParam(req.query.week), rates = loadRates(db), w = calcWeek(db, rates, wk);
+    const ads = db.prepare('SELECT employee, count FROM ad_edits WHERE week_start = ? ORDER BY employee').all(wk);
+    const rub = (n) => (n ? money(n) : html`<span class="mute">—</span>`);
+    return page(reply, req, '/payouts', 'Выплаты', html`<h1>Выплаты за неделю</h1>${flash(req)}
+      <p><a href="/payouts?week=${shiftWeek(wk, -1)}">← предыдущая</a> &nbsp; <b>${wk} — ${weekEnd(wk)}</b> &nbsp; <a href="/payouts?week=${shiftWeek(wk, 1)}">следующая →</a>
+        &nbsp;·&nbsp; <a href="/payouts/rates">Расценки и лимиты</a> &nbsp;·&nbsp; <a href="/export.xlsx?week=${wk}">⬇ xlsx</a></p>
+      <div class="cards"><div class="card"><div class="n">${money(w.total)}</div><div class="l">К выплате за неделю</div></div><div class="card"><div class="n">${w.rows.length}</div><div class="l">Сотрудников</div></div></div>
+      <h2>Начисления</h2>
+      ${w.rows.length ? html`<table><tr><th>Сотрудник</th><th class="r">Ситуации</th><th class="r">Мероприятия</th><th class="r">Эфиры</th><th class="r">Правок объявл.</th><th class="r">Объявления</th><th class="r">Бонус</th><th class="r">Итого</th></tr>
+        ${w.rows.map((e) => html`<tr><td><b>${e.nick}</b>${e.notes.map((n) => html`<div class="mute">⚠ ${n}</div>`)}
+          ${e.items.length ? html`<details><summary class="mute">публикации (${e.items.length})</summary>${e.items.map((i) => html`<div>${i.plan.planned_date} · ${PLAN_KINDS[i.plan.kind]} · ${i.plan.title} · ${i.plan.rating ? stars(i.plan.rating) : '—'} → ${money(i.amount)}${i.note ? html` <span class="mute">(${i.note})</span>` : ''}</div>`)}</details>` : ''}</td>
+          <td class="r">${rub(e.situation)}</td><td class="r">${rub(e.event)}</td><td class="r">${rub(e.radio)}</td><td class="r">${e.adCount || '—'}</td><td class="r">${rub(e.adPaid)}</td><td class="r">${rub(e.adBonus)}</td><td class="r"><b>${money(e.total)}</b></td></tr>`)}</table>`
+        : html`<p class="mute">За эту неделю начислений нет. Выплаты считаются по публикациям в статусе «Опубликовано» с типом, ответственным и оценкой (дата публикации — в плане) и по правкам объявлений ниже.</p>`}
+      ${w.skipped.length ? html`<h2>Не учтено</h2><table>${w.skipped.map((x) => html`<tr><td>${x.plan.planned_date}</td><td>${PLAN_KINDS[x.plan.kind]}: ${x.plan.title}</td><td class="mute">${x.why}</td></tr>`)}</table>` : ''}
+      <h2>Правки объявлений за неделю</h2>
+      <form method="post" action="/payouts/ads"><input type="hidden" name="week" value="${wk}"><div class="row"><label>Сотрудник<input name="employee" required maxlength="64"></label>
+        <label>Отредактировано объявлений<input name="count" type="number" min="0" max="100000" required></label><button>Сохранить</button></div></form>
+      ${ads.length ? html`<table><tr><th>Сотрудник</th><th class="r">Правок</th><th></th></tr>${ads.map((a) => html`<tr><td>${a.employee}</td><td class="r">${a.count}</td>
+        <td><form method="post" action="/payouts/ads/delete"><input type="hidden" name="week" value="${wk}"><input type="hidden" name="employee" value="${a.employee}"><button class="danger">×</button></form></td></tr>`)}</table>` : ''}`);
+  });
+
+  app.post('/payouts/ads', { preHandler: adminOnlyPage }, async (req, reply) => {
+    const wk = weekParam(req.body?.week), emp = String(req.body?.employee || '').trim().slice(0, 64), c = String(req.body?.count ?? '');
+    if (!emp || !/^\d{1,6}$/.test(c)) return redirect(reply, `/payouts?week=${wk}`, 'Укажите сотрудника и число правок', true);
+    db.prepare('INSERT INTO ad_edits (week_start, employee, count) VALUES (?,?,?) ON CONFLICT(week_start, employee) DO UPDATE SET count = excluded.count').run(wk, emp, Number(c));
+    return redirect(reply, `/payouts?week=${wk}`, 'Сохранено');
+  });
+  app.post('/payouts/ads/delete', { preHandler: adminOnlyPage }, async (req, reply) => {
+    const wk = weekParam(req.body?.week);
+    db.prepare('DELETE FROM ad_edits WHERE week_start = ? AND employee = ?').run(wk, String(req.body?.employee || ''));
+    return redirect(reply, `/payouts?week=${wk}`, 'Удалено');
+  });
+
+  app.get('/payouts/rates', { preHandler: adminOnlyPage }, async (req, reply) => {
+    const r = loadRates(db);
+    const num = (name, v, label, hint = '') => html`<label>${label}<input name="${name}" value="${v}" inputmode="numeric" required style="width:130px">${hint ? html`<span class="mute">${hint}</span>` : ''}</label>`;
+    const starRow = (prefix, obj) => [1, 2, 3, 4, 5].map((n) => num(`${prefix}_${n}`, obj[n], stars(n)));
+    return page(reply, req, '/payouts', 'Расценки', html`<p><a href="/payouts">← К выплатам</a></p><h1>Расценки и лимиты</h1>${flash(req)}
+      <form method="post" action="/payouts/rates">
+      <h2>Скриншот-ситуации (за одну, по оценке)</h2><div class="row">${starRow('sit', r.situation.stars)}${num('sit_cap', r.situation.weekCap, 'Лимит в неделю на сотрудника, $')}</div>
+      <h2>Редактирование объявлений</h2><div class="row">${num('ad_rate', r.ads.rate, 'За объявление, $')}${num('ad_bonus', r.ads.bonus, 'Бонус, $', 'раз в неделю')}
+        ${num('ad_bonus_after', r.ads.bonusAfter, 'Бонус, если правок больше')}${num('ad_limit', r.ads.paidLimit, 'Оплачивается не более, объявл./нед.')}</div>
+      <h2>Мероприятия (за одно, по оценке)</h2><div class="row">${starRow('ev', r.event.stars)}${num('ev_min', r.event.min, 'Минимум, $')}${num('ev_max', r.event.max, 'Максимум, $')}${num('ev_cap', r.event.weekCap, 'Лимит в неделю, $')}</div>
+      <h2>Радиоэфиры</h2><div class="row">${num('radio_rate', r.radio.rate, 'За качественный эфир, $')}${num('radio_min_stars', r.radio.minStars, 'Качественный — от скольки звёзд')}${num('radio_cap', r.radio.weekCap, 'Лимит в неделю, $')}</div>
+      <div class="row"><button>Сохранить расценки</button></div></form>
+      <form method="post" action="/payouts/rates/reset" onsubmit="return confirm('Вернуть расценки по умолчанию?')"><button class="danger">Сбросить к значениям по умолчанию</button></form>
+      <p class="mute">Изменение расценок пересчитывает и прошлые недели: расчёт всегда идёт по текущим расценкам.</p>`);
+  });
+  app.post('/payouts/rates', { preHandler: adminOnlyPage }, async (req, reply) => {
+    const r = parseRatesForm(req.body);
+    if (r.error) return redirect(reply, '/payouts/rates', r.error, true);
+    db.setSetting('rates', JSON.stringify(r.rates));
+    return redirect(reply, '/payouts/rates', 'Расценки сохранены');
+  });
+  app.post('/payouts/rates/reset', { preHandler: adminOnlyPage }, async (req, reply) => {
+    db.setSetting('rates', JSON.stringify(DEFAULT_RATES));
+    return redirect(reply, '/payouts/rates', 'Расценки сброшены');
   });
 
   // --- управление --------------------------------------------------------
