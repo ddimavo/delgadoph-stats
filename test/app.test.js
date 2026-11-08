@@ -6,7 +6,7 @@ import path from 'node:path';
 import { loadConfig } from '../src/config.js';
 import { buildApp } from '../src/app.js';
 import { normalizeScores, rawActivity, sectionStats } from '../src/stats.js';
-import { parseIngest, ValidationError } from '../src/ingest.js';
+import { parsePostLines, zonedToUtc } from '../src/manual.js';
 
 process.env.NODE_ENV = 'test';
 const ago = (h) => new Date(Date.now() - h * 3600_000).toISOString();
@@ -16,49 +16,57 @@ async function setup() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dps-'));
   const config = loadConfig({ DATA_DIR: dir, ADMIN_NICK: 'Brianna_Delgado', TZ_NAME: 'UTC' });
   const app = await buildApp(config);
-  const token = app.db.getSetting('ingest_token');
-  const ingest = (body, t = token) => app.inject({ method: 'POST', url: '/api/ingest', headers: { authorization: `Bearer ${t}` }, payload: body });
   const login = async (nick) => {
     const r = await app.inject({ method: 'POST', url: '/login', payload: `nick=${encodeURIComponent(nick)}`, headers: form });
     return { r, cookie: r.cookies[0] ? `sid=${r.cookies[0].value}` : '' };
   };
-  return { app, config, ingest, login, token };
+  return { app, config, login };
 }
 
-const section = { id: 5, title: 'Press releases', url: 'https://forum.example/topic/5-x/' };
+const w = { week: 0.5, month: 0.3, authors: 2 };
+const fmt = (iso) => { const d = new Date(iso); const z = (n) => String(n).padStart(2, '0'); return `${z(d.getUTCDate())}.${z(d.getUTCMonth() + 1)}.${d.getUTCFullYear()} ${z(d.getUTCHours())}:${z(d.getUTCMinutes())}`; };
 
 test('активность нормируется к 0–100', () => {
-  const w = { week: 0.5, month: 0.3, authors: 2 };
   assert.equal(rawActivity({ week: 4, month: 10, authors: 2 }, w), 9);
   assert.deepEqual(normalizeScores([9, 4.5, 0]), [100, 50, 0]);
   assert.deepEqual(normalizeScores([0, 0]), [0, 0]);
 });
 
-test('валидация ingest отклоняет мусор и убирает дубли', () => {
-  assert.throws(() => parseIngest({ section: {}, posts: [] }), ValidationError);
-  assert.throws(() => parseIngest({ section, posts: [{ id: 1, author: 'a', at: 'вчера' }] }), ValidationError);
-  const r = parseIngest({ section, posts: [{ id: 1, author: 'a', at: ago(1) }, { id: 1, author: 'a', at: ago(1) }] });
-  assert.equal(r.posts.length, 1);
+test('разбор строк: оба формата даты, часовой пояс, ошибки', () => {
+  const ok = parsePostLines('08.11.2026 22:58 Brianna_Delgado\n2026-11-07 17:16 Richard Northwood\n\n', 'Europe/Moscow', new Date('2026-11-09T00:00:00Z'));
+  assert.deepEqual(ok.errors, []);
+  assert.equal(ok.posts[0].at, '2026-11-08T19:58:00.000Z'); // МСК = UTC+3
+  assert.equal(ok.posts[1].author, 'Richard Northwood');
+  const bad = parsePostLines('вчера Ann\n31.02.2026 10:00 Ann\n01.01.2099 10:00 Ann', 'UTC', new Date('2026-11-09T00:00:00Z'));
+  assert.equal(bad.errors.length, 3);
+  assert.equal(zonedToUtc(2026, 7, 1, 12, 0, 'America/New_York').toISOString(), '2026-07-01T16:00:00.000Z'); // летнее время
 });
 
-test('ingest требует токен, считает периоды и удаляет пропавшие посты', async () => {
-  const { app, ingest, login } = await setup();
-  assert.equal((await ingest({ section, posts: [] }, 'bad')).statusCode, 401);
-  const posts = [
-    { id: 1, author: 'Ann', at: ago(2) }, { id: 2, author: 'ann', at: ago(30) },
-    { id: 3, author: 'Bob', at: ago(24 * 10) }, { id: 4, author: 'Cid', at: ago(24 * 40) },
-  ];
-  assert.equal((await ingest({ section, posts })).statusCode, 200);
+async function addSection(app, cookie, title = 'Press releases') {
+  const r = await app.inject({ method: 'POST', url: '/sections', payload: `title=${encodeURIComponent(title)}`, headers: { ...form, cookie } });
+  assert.equal(r.statusCode, 302);
+  return Number(/sections\/(\d+)/.exec(r.headers.location)[1]);
+}
+const addPostsHttp = (app, cookie, id, text) => app.inject({ method: 'POST', url: `/sections/${id}/posts`, payload: `text=${encodeURIComponent(text)}`, headers: { ...form, cookie } });
+
+test('ручной ввод: периоды, дубли игнорируются, ошибка — ничего не сохраняется', async () => {
+  const { app, login } = await setup();
   const { cookie } = await login('brianna_delgado'); // регистр ника не важен
+  const id = await addSection(app, cookie);
+  const text = [ago(2), ago(30), ago(24 * 10), ago(24 * 40)].map((t, i) => `${fmt(t)} ${['Ann', 'ann', 'Bob', 'Cid'][i]}`).join('\n');
+  assert.match(decodeURIComponent((await addPostsHttp(app, cookie, id, text)).headers.location), /Добавлено постов: 4/);
+  assert.match(decodeURIComponent((await addPostsHttp(app, cookie, id, text)).headers.location), /Добавлено постов: 0, уже были: 4/);
+  assert.match(decodeURIComponent((await addPostsHttp(app, cookie, id, `${fmt(ago(1))} Dan\nмусор`)).headers.location), /Ничего не сохранено/);
+  const st = sectionStats(app.db, { timezone: 'UTC', weights: w })[0];
+  assert.deepEqual([st.total, st.day, st.week, st.month, st.authors30], [4, 1, 2, 3, 2]);
+  assert.equal(st.topAuthors[0].count, 2);
   const page = await app.inject({ url: '/', headers: { cookie } });
-  assert.equal(page.statusCode, 200);
   assert.match(page.body, /Press releases/);
-  const ov = sectionStats(app.db, { timezone: 'UTC', weights: { week: 0.5, month: 0.3, authors: 2 } })[0];
-  assert.deepEqual([ov.total, ov.day, ov.week, ov.month, ov.authors30], [4, 1, 2, 3, 2]);
-  assert.equal(ov.topAuthors[0].nick.toLowerCase(), 'ann');
-  assert.equal(ov.topAuthors[0].count, 2);
-  await ingest({ section, posts: posts.slice(0, 1) }); // посты 2–4 удалены на форуме
-  assert.equal(app.db.prepare('SELECT COUNT(*) c FROM posts').get().c, 1);
+  const pid = app.db.prepare('SELECT id FROM posts LIMIT 1').get().id;
+  await app.inject({ method: 'POST', url: `/sections/${id}/posts/${pid}/delete`, headers: { cookie } });
+  assert.equal(app.db.prepare('SELECT COUNT(*) c FROM posts').get().c, 3);
+  await app.inject({ method: 'POST', url: `/sections/${id}/delete`, headers: { cookie } });
+  assert.equal(app.db.prepare('SELECT COUNT(*) c FROM posts').get().c, 0); // посты удаляются вместе с разделом
   await app.close();
 });
 
@@ -83,12 +91,13 @@ test('роль viewer не может менять план; editor может',
   await app.close();
 });
 
-test('XSS в нике автора экранируется', async () => {
-  const { app, ingest, login } = await setup();
-  await ingest({ section, posts: [{ id: 1, author: '<img src=x onerror=alert(1)>', at: ago(1) }] });
+test('XSS в нике автора и названии раздела экранируется', async () => {
+  const { app, login } = await setup();
   const { cookie } = await login('Brianna_Delgado');
-  const r = await app.inject({ url: '/sections/5', headers: { cookie } });
-  assert.ok(!r.body.includes('<img src=x'));
+  const id = await addSection(app, cookie, '<script>alert(2)</script>');
+  await addPostsHttp(app, cookie, id, `${fmt(ago(1))} <img src=x onerror=alert(1)>`);
+  const r = await app.inject({ url: `/sections/${id}`, headers: { cookie } });
+  assert.ok(!r.body.includes('<img src=x') && !r.body.includes('<script>alert'));
   await app.close();
 });
 

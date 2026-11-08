@@ -19,20 +19,21 @@ CREATE TABLE IF NOT EXISTS members (
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sections (
-  id INTEGER PRIMARY KEY,            -- id темы на форуме
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
-  url TEXT NOT NULL,
+  url TEXT NOT NULL DEFAULT '',      -- ссылка на тему форума (необязательно)
   author TEXT,
   created_at TEXT,
   locked INTEGER NOT NULL DEFAULT 0,
-  synced_at TEXT
+  synced_at TEXT                     -- когда последний раз вносили посты
 );
 CREATE TABLE IF NOT EXISTS posts (
-  id INTEGER PRIMARY KEY,            -- id комментария на форуме
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   section_id INTEGER NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
   author TEXT NOT NULL COLLATE NOCASE,
   posted_at TEXT NOT NULL            -- ISO 8601, UTC
 );
+CREATE UNIQUE INDEX IF NOT EXISTS posts_unique ON posts(section_id, author, posted_at);
 CREATE INDEX IF NOT EXISTS posts_section_time ON posts(section_id, posted_at);
 CREATE INDEX IF NOT EXISTS posts_time ON posts(posted_at);
 CREATE TABLE IF NOT EXISTS plans (
@@ -94,7 +95,6 @@ export function openDb(config) {
     db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(k, v);
 
   if (!db.getSetting('session_secret')) db.setSetting('session_secret', crypto.randomBytes(32).toString('hex'));
-  if (!db.getSetting('ingest_token')) db.setSetting('ingest_token', crypto.randomBytes(24).toString('hex'));
   if (config.adminNick) {
     db.prepare("INSERT OR IGNORE INTO members (nick, role, created_at) VALUES (?, 'admin', ?)").run(config.adminNick, now);
   }

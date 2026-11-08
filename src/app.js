@@ -7,9 +7,9 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { openDb, ROLES, PLAN_STATUSES } from './db.js';
-import { makeSession, readSession, safeEqual, makeLimiter } from './auth.js';
+import { makeSession, readSession, makeLimiter } from './auth.js';
 import { sectionStats, overview, userLeaderboard } from './stats.js';
-import { parseIngest, applyIngest, ValidationError } from './ingest.js';
+import { parsePostLines, addPosts } from './manual.js';
 import { html, raw, layout, fmtDate, fmtSize, barChart, sparkline } from './views.js';
 
 const INLINE_IMAGES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
@@ -26,16 +26,16 @@ export async function buildApp(config) {
   const loginLimit = makeLimiter(10, 60_000);
   const tz = config.timezone;
 
-  const redirect = (reply, to, msg) => reply.redirect(msg ? `${to}${to.includes('?') ? '&' : '?'}msg=${encodeURIComponent(msg)}` : to);
+  const redirect = (reply, to, msg, isError = false) => reply.redirect(msg ? `${to}${to.includes('?') ? '&' : '?'}msg=${encodeURIComponent(msg)}${isError ? '&e=1' : ''}` : to);
   const page = (reply, req, nav, title, body) => reply.type('text/html; charset=utf-8').send(layout({ title, user: req.user, body, nav }).toString());
-  const flash = (req) => (req.query?.msg ? html`<div class="ok">${req.query.msg}</div>` : '');
+  const flash = (req) => (req.query?.msg ? html`<div class="${req.query.e ? 'err' : 'ok'}">${req.query.msg}</div>` : '');
   const canEdit = (req) => req.user.role !== 'viewer';
   const forbid = (reply) => reply.code(403).type('text/plain; charset=utf-8').send('Недостаточно прав');
 
   // --- авторизация -------------------------------------------------------
   app.addHook('onRequest', async (req, reply) => {
     const p = req.url.split('?')[0];
-    if (p === '/login' || p === '/health' || p.startsWith('/api/')) return;
+    if (p === '/login' || p === '/health') return;
     const nick = readSession(secret, req.cookies.sid);
     const member = nick && db.prepare('SELECT nick, role FROM members WHERE nick = ?').get(nick);
     if (!member) return reply.redirect('/login');
@@ -80,7 +80,8 @@ export async function buildApp(config) {
       ${ranked.map((s) => html`<tr><td><a href="/sections/${s.section.id}">${s.section.title}</a></td><td class="r">${s.total}</td><td class="r">${s.day}</td><td class="r">${s.week}</td><td class="r">${s.month}</td><td class="r">${s.authors30}</td>
         <td>${sparkline(s.perDay)}</td><td class="mute">${fmtDate(s.last, tz)}</td><td><span class="score">${s.score}</span></td></tr>`)}</table>
       <p class="mute">Активность = (${w.week}×посты за 7д + ${w.month}×посты за 30д + ${w.authors}×уникальные авторы за 30д), нормировано к 0–100 по самому активному разделу.</p>`
-        : html`<div class="card">Данных пока нет. Установите сборщик (см. «Управление») и запустите синхронизацию на странице форума.</div>`}
+        : html`<div class="card">Разделов пока нет. Добавьте первый ниже и внесите в него посты.</div>`}
+      ${canEdit(req) ? html`<h2>Добавить раздел</h2>${sectionForm('/sections', {}, 'Добавить')}` : ''}
       <h2>Самые активные за 30 дней</h2>${leaderTable(top)}`);
   });
 
@@ -90,19 +91,81 @@ export async function buildApp(config) {
   app.get('/sections/:id', async (req, reply) => {
     const st = sectionStats(db, config).find((s) => s.section.id === Number(req.params.id));
     if (!st) return reply.code(404).type('text/plain; charset=utf-8').send('Раздел не найден');
-    const recent = db.prepare('SELECT id, author, posted_at FROM posts WHERE section_id = ? ORDER BY posted_at DESC LIMIT 50').all(st.section.id);
+    const recent = db.prepare('SELECT id, author, posted_at FROM posts WHERE section_id = ? ORDER BY posted_at DESC LIMIT 100').all(st.section.id);
     const hours = [...Array(24).keys()];
     const maxA = st.topAuthors[0]?.count || 1;
     return page(reply, req, '/', st.section.title, html`<p><a href="/">← Все разделы</a></p><h1>${st.section.title}</h1>
-      <p class="mute">Автор темы: ${st.section.author || '—'} · создана ${fmtDate(st.section.created_at, tz)} · синхронизация ${fmtDate(st.section.synced_at, tz)} · <a href="${st.section.url}" rel="noreferrer">открыть на форуме</a></p>
+      <p class="mute">Автор темы: ${st.section.author || '—'} · создана ${fmtDate(st.section.created_at, tz)} · данные внесены ${fmtDate(st.section.synced_at, tz)}${st.section.url ? html` · <a href="${st.section.url}" rel="noreferrer">открыть на форуме</a>` : ''}</p>
       <div class="cards">${[['Активность', st.score], ['Всего постов', st.total], ['24 часа', st.day], ['7 дней', st.week], ['30 дней', st.month], ['Авторов за 30д', st.authors30]]
         .map(([l, n]) => html`<div class="card"><div class="n">${n}</div><div class="l">${l}</div></div>`)}</div>
       <h2>Посты по дням (30 дней)</h2>${barChart(st.perDay, st.days)}
       <h2>Посты по часам суток (${tz})</h2>${barChart(st.perHour, hours.map((h) => `${h}:00`))}
+      ${flash(req)}${canEdit(req) ? html`<h2>Внести посты</h2>
+        <form method="post" action="/sections/${st.section.id}/posts"><label class="mute">Одна строка — один пост: <code>ДД.ММ.ГГГГ ЧЧ:ММ Ник</code> (время по поясу ${tz}). Повторно внесённые посты игнорируются.
+        <textarea name="text" rows="6" style="width:100%" placeholder="08.11.2026 22:58 Brianna_Delgado&#10;07.11.2026 17:16 Richard_Northwood" required></textarea></label>
+        <div class="row"><button>Внести</button></div></form>
+        <details><summary class="mute">Настройки раздела</summary>${sectionForm(`/sections/${st.section.id}/edit`, st.section, 'Сохранить')}
+        <form method="post" action="/sections/${st.section.id}/delete" onsubmit="return confirm('Удалить раздел вместе со всеми постами?')"><button class="danger">Удалить раздел</button></form></details>` : ''}
       <div class="grid2"><div><h2>Авторы</h2>${st.topAuthors.length ? html`<table><tr><th>Игрок</th><th class="r">Постов</th><th></th></tr>
         ${st.topAuthors.map((a) => html`<tr><td>${a.nick}</td><td class="r">${a.count}</td><td><div class="bar"><i style="width:${Math.round((a.count / maxA) * 100)}%"></i></div></td></tr>`)}</table>` : html`<p class="mute">Ответов нет.</p>`}</div>
-      <div><h2>Последние посты</h2>${recent.length ? html`<table><tr><th>Время</th><th>Автор</th></tr>
-        ${recent.map((p) => html`<tr><td><a href="${st.section.url}?do=findComment&comment=${p.id}" rel="noreferrer">${fmtDate(p.posted_at, tz)}</a></td><td>${p.author}</td></tr>`)}</table>` : html`<p class="mute">Ответов нет.</p>`}</div></div>`);
+      <div><h2>Последние посты</h2>${recent.length ? html`<table><tr><th>Время</th><th>Автор</th><th></th></tr>
+        ${recent.map((p) => html`<tr><td>${fmtDate(p.posted_at, tz)}</td><td>${p.author}</td><td>${canEdit(req) ? html`<form method="post" action="/sections/${st.section.id}/posts/${p.id}/delete"><button class="danger">×</button></form>` : ''}</td></tr>`)}</table>` : html`<p class="mute">Ответов нет.</p>`}</div></div>`);
+  });
+
+  function sectionForm(action, s, label) {
+    return html`<form method="post" action="${action}"><div class="row">
+      <label style="flex:2;min-width:240px">Название<input name="title" value="${s.title || ''}" required maxlength="300" style="width:100%"></label>
+      <label style="flex:2;min-width:240px">Ссылка на тему форума (необязательно)<input name="url" value="${s.url || ''}" maxlength="500" style="width:100%"></label>
+      <label>Автор темы<input name="author" value="${s.author || ''}" maxlength="64"></label>
+      <label>Создана<input type="date" name="created_at" value="${(s.created_at || '').slice(0, 10)}"></label>
+      <button>${label}</button></div></form>`;
+  }
+  function readSectionForm(b) {
+    const title = String(b?.title || '').trim().slice(0, 300);
+    if (!title) return { error: 'Укажите название раздела' };
+    const url = String(b?.url || '').trim();
+    if (url && !/^https?:\/\//.test(url)) return { error: 'Ссылка должна начинаться с http:// или https://' };
+    const created = b?.created_at ? String(b.created_at) : null;
+    if (created && !isDate(created)) return { error: 'Некорректная дата создания' };
+    return { v: { title, url, author: String(b?.author || '').trim().slice(0, 64) || null, created } };
+  }
+  const sectionExists = (id) => db.prepare('SELECT 1 FROM sections WHERE id = ?').get(id);
+
+  app.post('/sections', async (req, reply) => {
+    if (!canEdit(req)) return forbid(reply);
+    const r = readSectionForm(req.body);
+    if (r.error) return redirect(reply, '/', r.error);
+    const id = Number(db.prepare('INSERT INTO sections (title, url, author, created_at) VALUES (?,?,?,?)').run(r.v.title, r.v.url, r.v.author, r.v.created).lastInsertRowid);
+    return redirect(reply, `/sections/${id}`, 'Раздел добавлен — теперь внесите посты');
+  });
+  app.post('/sections/:id/edit', async (req, reply) => {
+    if (!canEdit(req)) return forbid(reply);
+    const id = Number(req.params.id), r = readSectionForm(req.body);
+    if (!sectionExists(id)) return redirect(reply, '/', 'Раздел не найден');
+    if (r.error) return redirect(reply, `/sections/${id}`, r.error);
+    db.prepare('UPDATE sections SET title=?, url=?, author=?, created_at=? WHERE id=?').run(r.v.title, r.v.url, r.v.author, r.v.created, id);
+    return redirect(reply, `/sections/${id}`, 'Сохранено');
+  });
+  app.post('/sections/:id/delete', async (req, reply) => {
+    if (!canEdit(req)) return forbid(reply);
+    db.prepare('DELETE FROM sections WHERE id = ?').run(Number(req.params.id));
+    return redirect(reply, '/', 'Раздел удалён');
+  });
+  app.post('/sections/:id/posts', async (req, reply) => {
+    if (!canEdit(req)) return forbid(reply);
+    const id = Number(req.params.id);
+    if (!sectionExists(id)) return redirect(reply, '/', 'Раздел не найден');
+    const { posts, errors } = parsePostLines(req.body?.text, tz);
+    if (errors.length) return redirect(reply, `/sections/${id}`, `Ничего не сохранено. ${errors.slice(0, 5).join('; ')}${errors.length > 5 ? ` …и ещё ${errors.length - 5}` : ''}`, true);
+    if (!posts.length) return redirect(reply, `/sections/${id}`, 'Нет строк для внесения');
+    const { added, skipped } = addPosts(db, id, posts);
+    db.prepare('UPDATE sections SET synced_at = ? WHERE id = ?').run(new Date().toISOString(), id);
+    return redirect(reply, `/sections/${id}`, `Добавлено постов: ${added}${skipped ? `, уже были: ${skipped}` : ''}`);
+  });
+  app.post('/sections/:id/posts/:pid/delete', async (req, reply) => {
+    if (!canEdit(req)) return forbid(reply);
+    db.prepare('DELETE FROM posts WHERE id = ? AND section_id = ?').run(Number(req.params.pid), Number(req.params.id));
+    return redirect(reply, `/sections/${req.params.id}`, 'Пост удалён');
   });
 
   app.get('/users', async (req, reply) => {
@@ -291,18 +354,12 @@ export async function buildApp(config) {
   const adminOnly = async (req, reply) => { if (req.user.role !== 'admin') return forbid(reply); };
   app.get('/admin', { preHandler: adminOnly }, async (req, reply) => {
     const members = db.prepare('SELECT * FROM members ORDER BY role, nick').all();
-    const origin = `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}`;
     return page(reply, req, '/admin', 'Управление', html`<h1>Управление</h1>${flash(req)}
       <h2>Доступ по нику</h2><p class="mute">Войти может только ник из этого списка. Пароля нет — это ограничение выбранной схемы входа, поэтому не публикуйте ссылку на сайт открыто.</p>
       <table><tr><th>Ник</th><th>Роль</th><th></th></tr>${members.map((m) => html`<tr><td>${m.nick}</td><td>${m.role}</td>
         <td>${m.nick.toLowerCase() === req.user.nick.toLowerCase() ? '' : html`<form method="post" action="/admin/members/delete"><input type="hidden" name="nick" value="${m.nick}"><button class="danger">Убрать</button></form>`}</td></tr>`)}</table>
       <form method="post" action="/admin/members"><div class="row"><label>Ник<input name="nick" required maxlength="64"></label>
-        <label>Роль<select name="role"><option value="editor">editor — план и файлы</option><option value="viewer">viewer — только просмотр</option><option value="admin">admin</option></select></label><button>Добавить / изменить</button></div></form>
-      <h2>Сборщик данных с форума</h2>
-      <p>Форум закрыт защитой от ботов, поэтому данные собирает скрипт в вашем браузере (файл <code>collector/forum-collector.user.js</code> в репозитории).
-      Поставьте его через Tampermonkey/Violentmonkey, откройте раздел форума и нажмите «Синхронизировать». В настройках скрипта укажите:</p>
-      <p>Адрес сайта: <code>${origin}</code><br>Токен: <code>${db.getSetting('ingest_token')}</code></p>
-      <form method="post" action="/admin/token" onsubmit="return confirm('Старый токен перестанет работать. Продолжить?')"><button>Выпустить новый токен</button></form>`);
+        <label>Роль<select name="role"><option value="editor">editor — план и файлы</option><option value="viewer">viewer — только просмотр</option><option value="admin">admin</option></select></label><button>Добавить / изменить</button></div></form>`);
   });
   app.post('/admin/members', { preHandler: adminOnly }, async (req, reply) => {
     const nick = String(req.body?.nick || '').trim();
@@ -318,32 +375,7 @@ export async function buildApp(config) {
     db.prepare('DELETE FROM members WHERE nick = ?').run(nick);
     return redirect(reply, '/admin', 'Удалено');
   });
-  app.post('/admin/token', { preHandler: adminOnly }, async (req, reply) => {
-    db.setSetting('ingest_token', crypto.randomBytes(24).toString('hex'));
-    return redirect(reply, '/admin', 'Новый токен выпущен');
-  });
 
-  // --- API для сборщика --------------------------------------------------
-  const apiAuth = (req, reply) => {
-    const h = String(req.headers.authorization || '');
-    if (!h.startsWith('Bearer ') || !safeEqual(h.slice(7), db.getSetting('ingest_token'))) {
-      reply.code(401).send({ error: 'Неверный токен' });
-      return false;
-    }
-    return true;
-  };
-  app.get('/api/ping', async (req, reply) => (apiAuth(req, reply) ? { ok: true } : undefined));
-  app.post('/api/ingest', async (req, reply) => {
-    if (!apiAuth(req, reply)) return;
-    try {
-      const data = parseIngest(req.body);
-      const res = applyIngest(db, data);
-      return { ok: true, section: data.section.id, ...res };
-    } catch (e) {
-      if (e instanceof ValidationError) return reply.code(400).send({ error: e.message });
-      throw e;
-    }
-  });
 
   app.addHook('onClose', async () => db.close());
   app.db = db;
