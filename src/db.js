@@ -3,12 +3,14 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 
 export const ROLES = ['admin', 'editor', 'viewer'];
-export const PLAN_KINDS = {
-  situation: 'Скриншот-ситуация',
-  event: 'Мероприятие',
-  radio: 'Радиоэфир',
-  other: 'Другое',
+// Разделы сайта по видам работ. Опубликованная публикация попадает в раздел своего вида автоматически.
+export const KIND_META = {
+  situation: { label: 'Скриншот-ситуации', single: 'Скриншот-ситуация', color: '#f59e0b', icon: 'camera' },
+  radio: { label: 'Радиоэфиры', single: 'Радиоэфир', color: '#a855f7', icon: 'mic' },
+  event: { label: 'Мероприятия', single: 'Мероприятие', color: '#22c55e', icon: 'calendar' },
+  other: { label: 'Прочее', single: 'Прочее', color: '#64748b', icon: 'file' },
 };
+export const PLAN_KINDS = Object.fromEntries(Object.entries(KIND_META).map(([k, v]) => [k, v.single]));
 export const PLAN_STATUSES = {
   idea: 'Идея',
   draft: 'В работе',
@@ -24,7 +26,7 @@ CREATE TABLE IF NOT EXISTS members (
   role TEXT NOT NULL CHECK (role IN ('admin','editor','viewer')),
   created_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS sections (
+CREATE TABLE IF NOT EXISTS topics (   -- темы форума, по которым ведётся статистика постов
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
   url TEXT NOT NULL DEFAULT '',      -- ссылка на тему форума (необязательно)
@@ -35,18 +37,18 @@ CREATE TABLE IF NOT EXISTS sections (
 );
 CREATE TABLE IF NOT EXISTS posts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  section_id INTEGER NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
+  topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
   author TEXT NOT NULL COLLATE NOCASE,
   posted_at TEXT NOT NULL            -- ISO 8601, UTC
 );
-CREATE UNIQUE INDEX IF NOT EXISTS posts_unique ON posts(section_id, author, posted_at);
-CREATE INDEX IF NOT EXISTS posts_section_time ON posts(section_id, posted_at);
+CREATE UNIQUE INDEX IF NOT EXISTS posts_unique ON posts(topic_id, author, posted_at);
+CREATE INDEX IF NOT EXISTS posts_topic_time ON posts(topic_id, posted_at);
 CREATE INDEX IF NOT EXISTS posts_time ON posts(posted_at);
 CREATE TABLE IF NOT EXISTS plans (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
-  section_id INTEGER REFERENCES sections(id) ON DELETE SET NULL,
+  topic_id INTEGER REFERENCES topics(id) ON DELETE SET NULL,
   planned_date TEXT,                 -- YYYY-MM-DD
   status TEXT NOT NULL DEFAULT 'idea',
   assignee TEXT NOT NULL DEFAULT '',
@@ -80,15 +82,27 @@ CREATE TABLE IF NOT EXISTS files (
 );
 `;
 
+/** Старые базы: «sections» (темы форума) -> «topics», section_id -> topic_id. */
+function migrateLegacy(db) {
+  const has = (t) => db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(t);
+  if (!has('sections') || has('topics')) return;
+  db.exec('ALTER TABLE sections RENAME TO topics');
+  for (const t of ['posts', 'plans']) {
+    if (has(t) && db.prepare(`PRAGMA table_info(${t})`).all().some((c) => c.name === 'section_id')) db.exec(`ALTER TABLE ${t} RENAME COLUMN section_id TO topic_id`);
+  }
+}
+
 export function openDb(config) {
   fs.mkdirSync(config.storageDir, { recursive: true });
   const db = new DatabaseSync(config.dbFile);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+  migrateLegacy(db);
   db.exec(SCHEMA);
   // Миграция плана публикаций: тип, оценка качества, ручная сумма (для мероприятий).
   const cols = new Set(db.prepare('PRAGMA table_info(plans)').all().map((c) => c.name));
   if (!cols.has('kind')) db.exec("ALTER TABLE plans ADD COLUMN kind TEXT NOT NULL DEFAULT 'other'");
   if (!cols.has('rating')) db.exec('ALTER TABLE plans ADD COLUMN rating INTEGER CHECK (rating BETWEEN 1 AND 5)');
+  if (!cols.has('url')) db.exec("ALTER TABLE plans ADD COLUMN url TEXT NOT NULL DEFAULT ''");
   if (!cols.has('payout_override')) db.exec('ALTER TABLE plans ADD COLUMN payout_override INTEGER');
 
   db.tx = (fn) => {

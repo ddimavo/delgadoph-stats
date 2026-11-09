@@ -36,11 +36,11 @@ export function parsePostLines(text, tz, now = new Date()) {
   return { posts, errors };
 }
 
-export function addPosts(db, sectionId, posts) {
-  const ins = db.prepare('INSERT OR IGNORE INTO posts (section_id, author, posted_at) VALUES (?,?,?)');
+export function addPosts(db, topicId, posts) {
+  const ins = db.prepare('INSERT OR IGNORE INTO posts (topic_id, author, posted_at) VALUES (?,?,?)');
   return db.tx(() => {
     let added = 0;
-    for (const p of posts) added += Number(ins.run(sectionId, p.author, p.at).changes);
+    for (const p of posts) added += Number(ins.run(topicId, p.author, p.at).changes);
     return { added, skipped: posts.length - added };
   });
 }
