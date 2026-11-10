@@ -82,7 +82,7 @@ function Shell({ route, onLogout }) {
   const nav = html`<nav class="nav" aria-label="Разделы сайта">
     <${NavLink} href="/" icon="dashboard" route=${route}>Обзор<//>
     <div class="nav-group">Контент</div>
-    ${['situation', 'radio', 'event'].map((k) => html`<${NavLink} href=${`/section/${k}`} icon=${kinds[k].icon} route=${route}>${kinds[k].label}<//>`)}
+    ${['situation', 'radio', 'event', 'press'].map((k) => html`<${NavLink} href=${`/section/${k}`} icon=${kinds[k].icon} route=${route}>${kinds[k].label}<//>`)}
     <${NavLink} href="/ads" icon="megaphone" route=${route}>Объявления<//>
     <${NavLink} href=${'/section/other'} icon="file" route=${route}>${kinds.other.label}<//>
     <div class="nav-group">Форум</div>

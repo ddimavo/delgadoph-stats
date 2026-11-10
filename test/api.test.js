@@ -202,3 +202,31 @@ test('клиентское приложение раздаётся статик�
   assert.equal((await app.inject({ url: '/api/nope' })).statusCode, 401); // API закрыт даже для несуществующих адресов
   await app.close();
 });
+
+test('пресс-релизы: отдельный раздел, наполняется автоматически, в выплатах не участвует', async () => {
+  const { app, as } = await setup();
+  const ed = await as('Ed'), boss = await as('Boss');
+  assert.equal((await ed('GET', '/api/me')).json.meta.kinds.press.label, 'Пресс-релизы');
+  await ed('POST', '/api/plans', { title: 'Итоги месяца', kind: 'press', status: 'published', planned_date: dayStr(-1), assignee: 'Ann', rating: 5 });
+  await ed('POST', '/api/plans', { title: 'Черновик релиза', kind: 'press', status: 'draft' });
+  const s = (await ed('GET', '/api/sections/press')).json;
+  assert.deepEqual(s.items.map((i) => i.title), ['Итоги месяца']);
+  assert.deepEqual(s.inProgress.map((i) => i.title), ['Черновик релиза']);
+  assert.equal(s.stats.avgRating, 5);
+  assert.equal((await ed('GET', '/api/overview')).json.content.byKind.press.published, 1);
+  assert.equal((await boss('GET', '/api/plans')).json.plans.find((p) => p.kind === 'press' && p.status === 'published').payout, 0);
+  await app.close();
+});
+
+test('бэкап: согласованная копия базы, хранятся только последние N', async () => {
+  const { app, config } = await setup();
+  app.db.prepare("INSERT INTO topics (title) VALUES ('Тема для копии')").run();
+  const { backupDb } = await import('../src/backup.js');
+  const dir = path.join(config.dataDir, 'backups');
+  for (const d of ['2026-01-01', '2026-01-02', '2026-01-03']) await backupDb(app.db, dir, { keep: 2, now: new Date(`${d}T10:00:00Z`) });
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['stats-2026-01-02.sqlite', 'stats-2026-01-03.sqlite']);
+  const copy = new DatabaseSync(path.join(dir, 'stats-2026-01-03.sqlite'));
+  assert.equal(copy.prepare('SELECT title FROM topics').get().title, 'Тема для копии');
+  copy.close();
+  await app.close();
+});

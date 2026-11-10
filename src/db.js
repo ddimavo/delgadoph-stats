@@ -8,6 +8,7 @@ export const KIND_META = {
   situation: { label: 'Скриншот-ситуации', single: 'Скриншот-ситуация', color: '#f59e0b', icon: 'camera' },
   radio: { label: 'Радиоэфиры', single: 'Радиоэфир', color: '#a855f7', icon: 'mic' },
   event: { label: 'Мероприятия', single: 'Мероприятие', color: '#22c55e', icon: 'calendar' },
+  press: { label: 'Пресс-релизы', single: 'Пресс-релиз', color: '#ec4899', icon: 'news' },
   other: { label: 'Прочее', single: 'Прочее', color: '#64748b', icon: 'file' },
 };
 export const PLAN_KINDS = Object.fromEntries(Object.entries(KIND_META).map(([k, v]) => [k, v.single]));

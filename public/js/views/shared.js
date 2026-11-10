@@ -45,7 +45,7 @@ export function PlanModal({ plan, defaults = {}, onClose, onSaved }) {
     if (!confirm('Удалить файл?')) return;
     try { await api(`/files/${id}`, { method: 'DELETE' }); setFiles((a) => a.filter((x) => x.id !== id)); } catch (err) { fail(err); }
   };
-  const autoNote = f.status === 'published' && ['situation', 'radio', 'event'].includes(f.kind)
+  const autoNote = f.status === 'published'
     ? html`<div class="badge" style=${`--c:${kinds[f.kind].color};margin-bottom:12px`}><${Icon} name="trend" size=${14} /> Появится в разделе «${kinds[f.kind].label}» автоматически</div>` : '';
 
   return html`<${Modal} title=${plan ? (readOnly ? 'Публикация' : 'Редактирование публикации') : 'Новая публикация'} onClose=${onClose} wide
